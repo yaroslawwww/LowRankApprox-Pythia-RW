@@ -151,3 +151,47 @@ class MiniAdam(torch.optim.Optimizer):
         if "projector" not in state:
             state["projector"] = copy.deepcopy(projector)
         return state["projector"]
+
+
+class ProjectedMiniAdam(MiniAdam):
+    def __init__(
+        self,
+        params,
+        projector,
+        lr: float = 1e-3,
+        betas=(0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+        decoupled_weight_decay: bool = True,
+        update_gap: int = 200,
+    ):
+        param_groups = self._with_projector(params, projector)
+        super().__init__(
+            param_groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            decoupled_weight_decay=decoupled_weight_decay,
+            update_gap=update_gap,
+        )
+
+    def _with_projector(self, params, projector):
+        if isinstance(params, dict):
+            params = [params]
+
+        if isinstance(params, (list, tuple)):
+            if len(params) > 0 and isinstance(params[0], dict):
+                groups = []
+                for group in params:
+                    group = dict(group)
+                    group.setdefault("projector", projector)
+                    groups.append(group)
+                return groups
+
+            return [{"params": params, "projector": projector}]
+
+        return [{"params": params, "projector": projector}]
+
+
+GaLoreMiniAdam = ProjectedMiniAdam
