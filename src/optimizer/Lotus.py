@@ -35,14 +35,14 @@ class Lotus:
             U, _, _ = get_svd(grad.T, **self.cfg)
             r = min(self.rank, U.shape[1])
             self.P = U[:, :r].to(grad.dtype)
-            g_init = self.P @ grad.T
+            g_init = self.P.T @ grad.T
             self.d_init = g_init / (torch.norm(g_init) + self.eps)
             self.T = 1
         else:
             U, _, _ = get_svd(grad, **self.cfg)
             r = min(self.rank, U.shape[1])
             self.P = U[:, :r].to(grad.dtype)
-            g_init = self.P @ grad
+            g_init = self.P.T @ grad
             self.d_init = g_init / (torch.norm(g_init) + self.eps)
             self.T = 1
 
