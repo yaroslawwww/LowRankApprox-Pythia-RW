@@ -56,6 +56,7 @@ class Pythia:
                 size.model_name,
                 revision=revision,
                 cache_dir=f"./pythia-{size.suffix.lower()}/{revision}",
+                attn_implementation="flash_attention_2",
             )
         return cls._models[size]
 
