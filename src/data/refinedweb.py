@@ -189,6 +189,7 @@ class RefinedWebStreamingDataset(IterableDataset):
         shuffle_buffer_size: Optional[int] = None,
         seed: int = 42,
         token: Optional[str] = None,
+        drop_last: bool = True,
     ):
         self.tokenizer = tokenizer
         self.seq_length = seq_length
@@ -198,6 +199,7 @@ class RefinedWebStreamingDataset(IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.seed = seed
         self.token = token
+        self.drop_last = drop_last
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         dataset = load_dataset(
@@ -216,10 +218,15 @@ class RefinedWebStreamingDataset(IterableDataset):
             for example in dataset:
                 yield _extract_text(example, self.text_column)
 
-        yield from _tokenize_texts(texts(), self.tokenizer, self.seq_length)
+        yield from _pack_texts(
+            texts(),
+            self.tokenizer,
+            self.seq_length,
+            drop_last=self.drop_last,
+        )
 
 
-class TokenizedCausalLMDataset(IterableDataset):
+class PackedCausalLMDataset(IterableDataset):
     def __init__(
         self,
         data_dir: str | Path,
@@ -228,6 +235,7 @@ class TokenizedCausalLMDataset(IterableDataset):
         text_column: Optional[str] = "text",
         shuffle_files: bool = False,
         seed: int = 42,
+        drop_last: bool = True,
     ):
         self.text_dataset = LocalJsonlTextDataset(
             data_dir=data_dir,
@@ -237,52 +245,174 @@ class TokenizedCausalLMDataset(IterableDataset):
         )
         self.tokenizer = tokenizer
         self.seq_length = seq_length
+        self.drop_last = drop_last
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        yield from _tokenize_texts(
+        yield from _pack_texts(
             self.text_dataset,
             self.tokenizer,
             self.seq_length,
+            drop_last=self.drop_last,
         )
 
 
-def _tokenize_texts(
+TokenizedCausalLMDataset = PackedCausalLMDataset
+
+
+def _tokenize_document(
+    text: str,
+    tokenizer,
+    seq_length: int,
+) -> list[list[int]]:
+    token_ids = tokenizer(
+        text,
+        add_special_tokens=False,
+    )["input_ids"]
+
+    eos_token_id = tokenizer.eos_token_id
+    chunk_size = seq_length
+    if eos_token_id is not None:
+        if seq_length < 2:
+            raise ValueError("seq_length must fit at least one token and EOS")
+        chunk_size = seq_length - 1
+
+    chunks = []
+    for start in range(0, len(token_ids), chunk_size):
+        end = start + chunk_size
+        chunk = token_ids[start:end]
+        if eos_token_id is not None:
+            chunk = chunk + [eos_token_id]
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def _make_packed_sample(
+    input_ids: list[int],
+    position_ids: list[int],
+    sequence_ids: list[int],
+) -> dict[str, torch.Tensor]:
+    input_tensor = torch.tensor(input_ids, dtype=torch.long)
+    position_tensor = torch.tensor(position_ids, dtype=torch.long)
+    sequence_tensor = torch.tensor(sequence_ids, dtype=torch.long)
+    labels = input_tensor.clone()
+    labels[position_tensor == 0] = -100
+    return {
+        "input_ids": input_tensor,
+        "attention_mask": torch.ones_like(input_tensor),
+        "labels": labels,
+        "position_ids": position_tensor,
+        "sequence_ids": sequence_tensor,
+    }
+
+
+def _pack_texts(
     texts: Iterable[str],
     tokenizer,
     seq_length: int,
+    drop_last: bool = True,
 ) -> Iterator[dict[str, torch.Tensor]]:
     if seq_length <= 0:
         raise ValueError("seq_length must be positive")
 
-    eos_token_id = tokenizer.eos_token_id
-    token_buffer: list[int] = []
+    input_ids: list[int] = []
+    position_ids: list[int] = []
+    sequence_ids: list[int] = []
+    sequence_id = 0
 
     for text in texts:
         if not text:
             continue
-        token_ids = tokenizer(
-            text,
-            add_special_tokens=False,
-        )["input_ids"]
-        if eos_token_id is not None:
-            token_ids.append(eos_token_id)
+        for chunk in _tokenize_document(text, tokenizer, seq_length):
+            if len(input_ids) + len(chunk) > seq_length:
+                yield _make_packed_sample(
+                    input_ids,
+                    position_ids,
+                    sequence_ids,
+                )
+                input_ids = []
+                position_ids = []
+                sequence_ids = []
+                sequence_id = 0
 
-        token_buffer.extend(token_ids)
-        while len(token_buffer) >= seq_length:
-            chunk = token_buffer[:seq_length]
-            del token_buffer[:seq_length]
-            input_ids = torch.tensor(chunk, dtype=torch.long)
-            yield {
-                "input_ids": input_ids,
-                "attention_mask": torch.ones_like(input_ids),
-                "labels": input_ids.clone(),
-            }
+            input_ids.extend(chunk)
+            position_ids.extend(range(len(chunk)))
+            sequence_ids.extend([sequence_id] * len(chunk))
+            sequence_id += 1
+
+            if len(input_ids) == seq_length:
+                yield _make_packed_sample(
+                    input_ids,
+                    position_ids,
+                    sequence_ids,
+                )
+                input_ids = []
+                position_ids = []
+                sequence_ids = []
+                sequence_id = 0
+
+    if input_ids and not drop_last:
+        yield _make_packed_sample(input_ids, position_ids, sequence_ids)
 
 
-def _collate_causal_lm(batch: list[dict[str, torch.Tensor]]) -> dict:
+def build_packed_attention_mask(sequence_ids: torch.Tensor) -> torch.Tensor:
+    _, seq_length = sequence_ids.shape
+    token_index = torch.arange(
+        seq_length,
+        device=sequence_ids.device,
+    )
+    causal_mask = token_index[:, None] >= token_index[None, :]
+    same_sequence = sequence_ids[:, :, None] == sequence_ids[:, None, :]
+    valid_tokens = sequence_ids >= 0
+    return (
+        same_sequence
+        & causal_mask
+        & valid_tokens[:, :, None]
+        & valid_tokens[:, None, :]
+    )
+
+
+def _pad_batch(
+    batch: list[dict[str, torch.Tensor]],
+    pad_token_id: int,
+) -> dict[str, torch.Tensor]:
+    max_length = max(example["input_ids"].numel() for example in batch)
     output = {}
-    for key in batch[0]:
-        output[key] = torch.stack([example[key] for example in batch])
+    pad_values = {
+        "input_ids": pad_token_id,
+        "attention_mask": 0,
+        "labels": -100,
+        "position_ids": 0,
+        "sequence_ids": -1,
+    }
+    for key, pad_value in pad_values.items():
+        values = []
+        for example in batch:
+            value = example[key]
+            pad_length = max_length - value.numel()
+            if pad_length:
+                padding = torch.full(
+                    (pad_length,),
+                    pad_value,
+                    dtype=value.dtype,
+                )
+                value = torch.cat([value, padding])
+            values.append(value)
+        output[key] = torch.stack(values)
+    return output
+
+
+def _collate_causal_lm(
+    batch: list[dict[str, torch.Tensor]],
+    pad_token_id: int,
+    packed_attention: bool,
+) -> dict[str, torch.Tensor]:
+    output = _pad_batch(batch, pad_token_id)
+    if packed_attention:
+        output["padding_mask"] = output["attention_mask"]
+        output["attention_mask"] = build_packed_attention_mask(
+            output["sequence_ids"],
+        )
     return output
 
 
@@ -296,19 +426,30 @@ def build_refinedweb_dataloader(
     seed: int = 42,
     num_workers: int = 0,
     pin_memory: bool = False,
+    drop_last: bool = True,
+    packed_attention: bool = True,
 ) -> DataLoader:
-    dataset = TokenizedCausalLMDataset(
+    dataset = PackedCausalLMDataset(
         data_dir=data_dir,
         tokenizer=tokenizer,
         seq_length=seq_length,
         text_column=text_column,
         shuffle_files=shuffle_files,
         seed=seed,
+        drop_last=drop_last,
     )
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id or 0
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        collate_fn=_collate_causal_lm,
+        collate_fn=lambda batch: _collate_causal_lm(
+            batch,
+            pad_token_id,
+            packed_attention,
+        ),
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
